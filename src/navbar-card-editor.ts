@@ -80,6 +80,7 @@ export class NavbarCardEditor extends LitElement {
   @property({ attribute: false }) public hass: any;
   @state() private _config: NavbarCardConfig = { routes: [] };
   @state() private _loadingComponents: boolean = false;
+  @state() private _templateModeByField: Record<string, boolean> = {};
   @state() private _lazyLoadedSections: Record<
     LazyLoadedEditorSections,
     boolean
@@ -89,6 +90,7 @@ export class NavbarCardEditor extends LitElement {
 
   protected firstUpdated(_changedProperties: PropertyValues): void {
     super.firstUpdated(_changedProperties);
+    this._templateModeByField = {};
     this._loadingComponents = true;
     loadHaComponents([
       'ha-form',
@@ -127,33 +129,137 @@ export class NavbarCardEditor extends LitElement {
   /* Config mutation functions */
   /**********************************************************************/
 
+  private _dispatchConfigChangedEvent() {
+    this.dispatchEvent(
+      new CustomEvent('config-changed', {
+        detail: {
+          config: this._config,
+        },
+      }),
+    );
+  }
+
   setConfig(config: NavbarCardConfig) {
     this._config = config;
   }
 
   updateConfig(newConfig: DeepPartial<NavbarCardConfig>) {
     this._config = deepMergeKeepArrays(this._config, newConfig);
-    this.dispatchEvent(
-      new CustomEvent('config-changed', {
-        detail: { config: this._config },
-      }),
-    );
+    this._dispatchConfigChangedEvent();
   }
 
   // TODO change the type of "value"
   updateConfigByKey(
     key: DotNotationKeys<NavbarCardConfig>,
-    value: NestedType<
-      NavbarCardConfig,
-      DotNotationKeys<NavbarCardConfig>
-    > | null,
+    value:
+      | NestedType<NavbarCardConfig, DotNotationKeys<NavbarCardConfig>>
+      | null
+      | undefined,
   ) {
-    this._config = genericSetProperty(this._config, key, value);
-    this.dispatchEvent(
-      new CustomEvent('config-changed', {
-        detail: { config: this._config },
-      }),
+    this._config = genericSetProperty(this._config, key, value, {
+      allowDeletion: true,
+    });
+    this._dispatchConfigChangedEvent();
+  }
+
+  private addMediaPlayer = () => {
+    const players = this._config.media_player?.players ?? [];
+    const newPlayer: MediaPlayerPlayerConfig = { entity: '' };
+    this.updateConfig({
+      media_player: {
+        ...this._config.media_player,
+        players: [...players, newPlayer],
+      },
+    });
+  };
+
+  private removeMediaPlayer = (playerIndex: number) => {
+    const players = [...(this._config.media_player?.players ?? [])];
+    players.splice(playerIndex, 1);
+    this.updateConfig({
+      media_player: {
+        ...this._config.media_player,
+        players: players.length === 0 ? undefined : players,
+      },
+    });
+  };
+
+  private addRouteOrPopup = (routeIndex?: number) => {
+    let routes = [...(this._config.routes ?? [])];
+    const newItemData = {
+      icon: 'mdi:alert-circle-outline',
+      label: '',
+      url: '',
+    };
+    if (routeIndex == null) {
+      routes = [...routes, newItemData];
+    } else {
+      const popup = [...(routes[routeIndex].popup || []), newItemData];
+      routes[routeIndex] = { ...routes[routeIndex], popup };
+    }
+
+    this.updateConfig({ routes });
+  };
+
+  private removeRouteOrPopup = (routeIndex: number, popupIndex?: number) => {
+    if (!this._config.routes || this._config.routes.length == 0) return;
+    const routes = [...this._config.routes];
+
+    if (popupIndex == null) {
+      routes.splice(routeIndex, 1);
+    } else {
+      const popup = [...(routes[routeIndex].popup || [])];
+      popup.splice(popupIndex, 1);
+      routes[routeIndex] = {
+        ...routes[routeIndex],
+        popup: popup.length === 0 ? undefined : popup,
+      };
+    }
+
+    this.updateConfig({ routes: routes.length === 0 ? undefined : routes });
+  };
+
+  /**********************************************************************/
+  /* Template overrides functions */
+  /**********************************************************************/
+
+  private _hasTemplateOverrides(): boolean {
+    const { template: _template, routes, ...rest } = this._config as any;
+    const hasExtraFields = Object.keys(rest).some(
+      k => k !== 'type' && rest[k] != null,
     );
+    const hasRoutes = Array.isArray(routes) && routes.length > 0;
+    return hasExtraFields || hasRoutes;
+  }
+
+  private _resetToTemplateOnly = () => {
+    const type = (this._config as any).type;
+    // @ts-expect-error: intentionally omitting routes to clear all overrides
+    this._config = {
+      ...(type != null ? { type } : {}),
+      template: this._config.template,
+    };
+    this._dispatchConfigChangedEvent();
+  };
+
+  /**********************************************************************/
+  /* Template detection functions */
+  /**********************************************************************/
+  private _isTemplateMode(configKey: DotNotationKeys<NavbarCardConfig>) {
+    const modeByField = this._templateModeByField[String(configKey)];
+    if (modeByField !== undefined) return modeByField;
+
+    return isTemplate(genericGetProperty(this._config, configKey));
+  }
+
+  private _setTemplateMode(
+    configKey: DotNotationKeys<NavbarCardConfig>,
+    isTemplate: boolean,
+  ) {
+    this._templateModeByField = {
+      ...this._templateModeByField,
+      [String(configKey)]: isTemplate,
+    };
   }
 
   /**********************************************************************/
@@ -291,23 +397,29 @@ export class NavbarCardEditor extends LitElement {
 
     const value = genericGetProperty(this._config, options.configKey) as
       | string
+      | null
       | undefined;
-    const isTemplate =
-      typeof value === 'string' &&
-      value.trim().startsWith('[[[') &&
-      value.trim().endsWith(']]]');
+    const isTemplate = this._isTemplateMode(options.configKey);
 
     // Handler to toggle between template and text
     const toggleMode = () => {
-      let newValue: string | null = value ? value.toString() : '';
       if (isTemplate) {
-        // Remove template delimiters
-        newValue = cleanTemplate(newValue);
+        this._setTemplateMode(options.configKey, false);
+        const uiValue =
+          typeof value === 'string' ? (cleanTemplate(value) ?? '').trim() : '';
+        this.updateConfigByKey(
+          options.configKey,
+          uiValue === '' ? null : uiValue,
+        );
       } else {
-        // Add template delimiters
-        newValue = wrapTemplate(newValue);
+        this._setTemplateMode(options.configKey, true);
+        const templateSource =
+          typeof value === 'string' ? (cleanTemplate(value) ?? '').trim() : '';
+        this.updateConfigByKey(
+          options.configKey,
+          templateSource === '' ? null : wrapTemplate(templateSource),
+        );
       }
-      this.updateConfigByKey(options.configKey, newValue);
     };
 
     // Button label and icon
@@ -335,7 +447,7 @@ export class NavbarCardEditor extends LitElement {
         ${
           isTemplate
             ? this.makeTemplateEditor({
-                allowNull: false,
+                allowNull: true,
                 configKey: options.configKey,
                 helper: options.templateHelper,
                 label: '',
@@ -400,11 +512,10 @@ export class NavbarCardEditor extends LitElement {
               '',
           )}
           @value-changed=${e => {
+            this._setTemplateMode(options.configKey, true);
             const templateValue =
               e.target.value?.trim() == ''
-                ? options.allowNull
-                  ? null
-                  : '[[[]]]'
+                ? null
                 : wrapTemplate(e.target.value);
             this.updateConfigByKey(options.configKey, templateValue);
           }}></ha-code-editor>
@@ -753,19 +864,19 @@ export class NavbarCardEditor extends LitElement {
                 Advanced features
               </h5>
               <div class="editor-section">
-                ${this.makeTemplateEditor({
+                ${this.makeTemplatable({
                   configKey: `${baseConfigKey}.hidden` as any,
-                  helper: BOOLEAN_JS_TEMPLATE_HELPER,
-                  // TODO JLAQ maybe replace with a templateSwitchEditor
+                  inputType: 'switch',
                   label: 'Hidden',
+                  templateHelper: BOOLEAN_JS_TEMPLATE_HELPER,
                 })}
                 ${
                   !isPopup
-                    ? this.makeTemplateEditor({
+                    ? this.makeTemplatable({
                         configKey: `${baseConfigKey}.selected` as any,
-                        helper: BOOLEAN_JS_TEMPLATE_HELPER,
-                        // TODO JLAQ maybe replace with a templateSwitchEditor
+                        inputType: 'switch',
                         label: 'Selected',
+                        templateHelper: BOOLEAN_JS_TEMPLATE_HELPER,
                       })
                     : html``
                 }
@@ -816,6 +927,36 @@ export class NavbarCardEditor extends LitElement {
       onDelete: () => this.removeRouteOrPopup(routeIndex, popupIndex),
       onDrop,
     });
+  }
+
+  private _chooseIconForAction(actionType: HAActions) {
+    switch (actionType) {
+      case HAActions.hold_action:
+        return 'mdi:gesture-tap-hold';
+      case HAActions.double_tap_action:
+        return 'mdi:gesture-double-tap';
+      case HAActions.tap_action:
+      default:
+        return 'mdi:gesture-tap';
+    }
+  }
+
+  private _chooseLabelForAction(actionType: HAActions) {
+    switch (actionType) {
+      case HAActions.tap_action:
+        return 'Tap action';
+      case HAActions.hold_action:
+        return 'Hold action';
+      case HAActions.double_tap_action:
+        return 'Double tap action';
+      default:
+        return '';
+    }
+  }
+
+  private isCustomAction(value: string) {
+    if (value === 'none') return false;
+    return Object.values(NavbarCustomActions).includes(value as any);
   }
 
   /**********************************************************************/
@@ -1011,10 +1152,11 @@ export class NavbarCardEditor extends LitElement {
             ],
             label: 'Desktop position',
           })}
-          ${this.makeTemplateEditor({
+          ${this.makeTemplatable({
             configKey: 'media_player.show',
-            helper: BOOLEAN_JS_TEMPLATE_HELPER,
+            inputType: 'switch',
             label: 'Show media player widget',
+            templateHelper: BOOLEAN_JS_TEMPLATE_HELPER,
           })}
         </div>
         <div class="editor-section">
@@ -1135,28 +1277,6 @@ export class NavbarCardEditor extends LitElement {
       onDrop,
     });
   }
-
-  private addMediaPlayer = () => {
-    const players = this._config.media_player?.players ?? [];
-    const newPlayer: MediaPlayerPlayerConfig = { entity: '' };
-    this.updateConfig({
-      media_player: {
-        ...this._config.media_player,
-        players: [...players, newPlayer],
-      },
-    });
-  };
-
-  private removeMediaPlayer = (playerIndex: number) => {
-    const players = [...(this._config.media_player?.players ?? [])];
-    players.splice(playerIndex, 1);
-    this.updateConfig({
-      media_player: {
-        ...this._config.media_player,
-        players: players.length === 0 ? undefined : players,
-      },
-    });
-  };
 
   renderDesktopEditor() {
     const labelVisibility =
@@ -1314,36 +1434,6 @@ export class NavbarCardEditor extends LitElement {
         </div>
       </ha-expansion-panel>
     `;
-  }
-
-  _chooseIconForAction(actionType: HAActions) {
-    switch (actionType) {
-      case HAActions.hold_action:
-        return 'mdi:gesture-tap-hold';
-      case HAActions.double_tap_action:
-        return 'mdi:gesture-double-tap';
-      case HAActions.tap_action:
-      default:
-        return 'mdi:gesture-tap';
-    }
-  }
-
-  _chooseLabelForAction(actionType: HAActions) {
-    switch (actionType) {
-      case HAActions.tap_action:
-        return 'Tap action';
-      case HAActions.hold_action:
-        return 'Hold action';
-      case HAActions.double_tap_action:
-        return 'Double tap action';
-      default:
-        return '';
-    }
-  }
-
-  isCustomAction(value: string) {
-    if (value === 'none') return false;
-    return Object.values(NavbarCustomActions).includes(value as any);
   }
 
   makeActionSelector(options: {
@@ -1564,20 +1654,29 @@ export class NavbarCardEditor extends LitElement {
         ${
           this._config.template != undefined &&
           this._config.template?.trim() != ''
-            ? html`<ha-alert alert-type="warning"
-              >You have the <code>template</code> field configured for
-              navbar-card. Using the editor will override the props for
-              <strong>this card only</strong>, but will not update the template
-              defined in your dashboard.
-              <br />
-              <a
-                href="${DOCS_LINKS.template}"
-                target="_blank"
-                rel="noopener"
-                >Check the documentation</a
-              >
-              to know how to configure your navbar-card templates.</ha-alert
-            >`
+            ? html`
+              <ha-alert alert-type="warning">
+                You have the <code>template</code> field configured for
+                navbar-card. Using the editor will override the props for
+                <strong>this card only</strong>, but will not update the
+                template defined in your dashboard.
+                <br />
+                <a
+                  href="${DOCS_LINKS.template}"
+                  target="_blank"
+                  rel="noopener"
+                  >Check the documentation</a
+                >
+                to know how to configure your navbar-card templates.
+                <ha-button
+                  class="reset-overrides-button"
+                  slot="action"
+                  .disabled=${!this._hasTemplateOverrides()}
+                  @click=${this._resetToTemplateOnly}>
+                  Reset overrides
+                </ha-button>
+              </ha-alert>
+            `
             : html``
         }
         ${this.renderTemplateEditor()} ${this.renderRoutesEditor()}
@@ -1590,39 +1689,4 @@ export class NavbarCardEditor extends LitElement {
   }
 
   static styles = getEditorStyles();
-
-  private addRouteOrPopup = (routeIndex?: number) => {
-    let routes = [...(this._config.routes ?? [])];
-    const newItemData = {
-      icon: 'mdi:alert-circle-outline',
-      label: '',
-      url: '',
-    };
-    if (routeIndex == null) {
-      routes = [...routes, newItemData];
-    } else {
-      const popup = [...(routes[routeIndex].popup || []), newItemData];
-      routes[routeIndex] = { ...routes[routeIndex], popup };
-    }
-
-    this.updateConfig({ routes });
-  };
-
-  private removeRouteOrPopup = (routeIndex: number, popupIndex?: number) => {
-    if (!this._config.routes || this._config.routes.length == 0) return;
-    const routes = [...this._config.routes];
-
-    if (popupIndex == null) {
-      routes.splice(routeIndex, 1);
-    } else {
-      const popup = [...(routes[routeIndex].popup || [])];
-      popup.splice(popupIndex, 1);
-      routes[routeIndex] = {
-        ...routes[routeIndex],
-        popup: popup.length === 0 ? undefined : popup,
-      };
-    }
-
-    this.updateConfig({ routes: routes.length === 0 ? undefined : routes });
-  };
 }
